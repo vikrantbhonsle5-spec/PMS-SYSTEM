@@ -38,7 +38,7 @@ else:
     pms_df = get_default_data()
 
 symbol_col = next((col for col in pms_df.columns if col.lower() in ['symbol', 'ticker', 'stock', 'code']), None)
-tickers_list = pms_df[symbol_col].dropna().astype(str).tolist() if symbol_col else get_default_data()['Symbol'].tolist()
+tickers_list = pms_df[symbol_col].dropna().astype(str).str.strip().tolist() if symbol_col else [d['Symbol'] for d in DEFAULT_PORTFOLIO]
 
 with st.expander("📁 View / Download Current Watchlist", expanded=False):
     st.dataframe(pms_df, use_container_width=True)
@@ -54,21 +54,20 @@ with st.expander("📁 View / Download Current Watchlist", expanded=False):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# Candlestick Pattern Detection Logic
+# Candlestick Pattern Logic
 def detect_candlestick_patterns(df):
     if df is None or len(df) < 2:
         return "Insufficient Data", "Neutral"
     
     prev, curr = df.iloc[-2], df.iloc[-1]
-    c_open, c_close, c_high, c_low = curr['Open'], curr['Close'], curr['High'], curr['Low']
-    p_open, p_close = prev['Open'], prev['Close']
+    c_open, c_close, c_high, c_low = float(curr['Open']), float(curr['Close']), float(curr['High']), float(curr['Low'])
+    p_open, p_close = float(prev['Open']), float(prev['Close'])
     
     body = abs(c_close - c_open)
     candle_range = c_high - c_low
     is_bullish = c_close > c_open
     is_bearish = c_close < c_open
     
-    # Core Candlestick Rules
     if body <= (candle_range * 0.1) and candle_range > 0:
         return "Doji", "Indecision / Reversal Warning"
     elif p_close < p_open and is_bullish and c_close >= p_open and c_open <= p_close:
@@ -86,23 +85,24 @@ def detect_candlestick_patterns(df):
     
     return "No Clear Pattern", "Neutral"
 
-# Optimized Fast Fetching with 1-Year Period & Cached Results
+# Robust Data Fetcher
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_resampled_data(ticker):
     try:
-        data = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=False)
+        data = yf.Ticker(ticker).history(period="1y", interval="1d")
         if data.empty:
             return None, None, None
             
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-            
-        df_d = data.copy()
+        data = data.reset_index()
+        data.rename(columns={'Date': 'Date', 'Open': 'Open', 'High': 'High', 'Low': 'Low', 'Close': 'Close', 'Volume': 'Volume'}, inplace=True)
+        data.set_index('Date', inplace=True)
+        
+        df_d = data[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
         df_w = df_d.resample('W').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
         df_m = df_d.resample('ME').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
         
         return df_d, df_w, df_m
-    except Exception:
+    except Exception as e:
         return None, None, None
 
 # App UI Controls
@@ -121,9 +121,8 @@ if ticker_to_run:
         df_d, df_w, df_m = fetch_resampled_data(ticker_to_run)
     
     if df_d is None or df_d.empty:
-        st.error(f"Could not load stock data for '{ticker_to_run}'. Verify the symbol.")
+        st.error(f"Could not fetch data for '{ticker_to_run}'. Please verify the stock ticker symbol.")
     else:
-        # Detect patterns for Daily, Weekly, and Monthly timeframes
         pat_d, sig_d = detect_candlestick_patterns(df_d)
         pat_w, sig_w = detect_candlestick_patterns(df_w)
         pat_m, sig_m = detect_candlestick_patterns(df_m)
@@ -134,19 +133,19 @@ if ticker_to_run:
             st.subheader("🗓️ Daily Pattern")
             st.info(f"**Pattern:** {pat_d}")
             st.metric("Expected Direction", sig_d)
-            st.caption(f"Close: {df_d['Close'].iloc[-1]:.2f}")
+            st.caption(f"Close: {float(df_d['Close'].iloc[-1]):.2f}")
             
         with c2:
             st.subheader("📅 Weekly Pattern")
             st.info(f"**Pattern:** {pat_w}")
             st.metric("Expected Direction", sig_w)
-            st.caption(f"Close: {df_w['Close'].iloc[-1]:.2f}")
+            st.caption(f"Close: {float(df_w['Close'].iloc[-1]):.2f}")
             
         with c3:
             st.subheader("📆 Monthly Pattern")
             st.info(f"**Pattern:** {pat_m}")
             st.metric("Expected Direction", sig_m)
-            st.caption(f"Close: {df_m['Close'].iloc[-1]:.2f}")
+            st.caption(f"Close: {float(df_m['Close'].iloc[-1]):.2f}")
             
         st.divider()
         
