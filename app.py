@@ -1,338 +1,594 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import requests
-import plotly.graph_objects as go
+import io
+import gzip
+import math
+import re
+import time
 from datetime import datetime, timedelta
 
-# -----------------------------------------------------------------------------
-# STREAMLIT PAGE CONFIG & SETUP
-# -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="100-Point PMS Stock Selection System",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+import yfinance as yf
+import plotly.graph_objects as go
 
-st.title("📊 100-Point PMS Stock Selection & Scoring Engine")
-st.markdown("Automated screening based on 20-Step Fundamental, Technical, Momentum, Sector & Macro Parameters.")
+st.set_page_config(page_title="PMS Stock Filter — NSE / BSE", layout="wide")
 
-# -----------------------------------------------------------------------------
-# SIDEBAR CONTROLS
-# -----------------------------------------------------------------------------
-st.sidebar.header("⚙️ Universe & Filter Settings")
+# -----------------------------
+# PMS scoring rules from PMS.xlsx
+# -----------------------------
+FUND_WEIGHTS = {
+    "Sales Growth": 5,
+    "Profit Growth": 5,
+    "EPS Growth": 4,
+    "ROCE": 4,
+    "ROE": 3,
+    "Debt/Equity": 3,
+    "Operating Cash Flow": 3,
+    "Promoter Holding/Pledge": 2,
+    "Valuation": 1,
+}
 
-exchange_choice = st.sidebar.selectbox("Select Exchange Universe", ["NSE Only", "NSE + BSE", "BSE Only"])
-min_mcap = st.sidebar.number_input("Min Market Cap (₹ Cr)", value=5000, step=500)
-min_sales_growth = st.sidebar.slider("Min Sales Growth (%)", -20.0, 50.0, 0.0)
-min_pat_growth = st.sidebar.slider("Min Profit Growth (%)", -20.0, 50.0, 0.0)
-min_roce = st.sidebar.slider("Min ROCE (%)", 0.0, 40.0, 15.0)
-min_roe = st.sidebar.slider("Min ROE (%)", 0.0, 40.0, 12.0)
-max_debt_equity = st.sidebar.slider("Max Debt / Equity", 0.0, 3.0, 1.0)
-max_candidates = st.sidebar.slider("Max Stocks for Detailed Scan", 10, 500, 100)
+TECH_WEIGHTS = {
+    "Price > 200 DMA": 2,
+    "Price > 50 DMA": 2,
+    "50 DMA > 200 DMA": 2,
+    "200 DMA rising": 2,
+    "Support": 2,
+    "Resistance / breakout proximity": 2,
+    "Volume": 2,
+    "RSI 55-70": 2,
+    "Higher high / higher low": 2,
+    "Breakout": 2,
+}
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🏆 Score Thresholds")
-st.sidebar.markdown("**80+** : Top Conviction (A+)")
-st.sidebar.markdown("**65-79** : Moderate Quality (B)")
-st.sidebar.markdown("**<65** : Watchlist / Reject")
+UPSTOX_NSE_INSTRUMENTS = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+UPSTOX_BSE_INSTRUMENTS = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"
 
-# -----------------------------------------------------------------------------
-# CANDLESTICK PATTERN ENGINE
-# -----------------------------------------------------------------------------
-def detect_candlestick_patterns(df):
-    if len(df) < 5:
-        return "No Pattern"
-    
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    o, h, l, c = latest['Open'], latest['High'], latest['Low'], latest['Close']
-    po, ph, pl, pc = prev['Open'], prev['High'], prev['Low'], prev['Close']
-    
-    body = abs(c - o)
-    candle_range = h - l if h != l else 0.0001
-    upper_shade = h - max(c, o)
-    lower_shade = min(c, o) - l
-    
-    # Pattern Logic
-    if body <= (candle_range * 0.1):
-        return "Doji (Indecision)"
-    elif (lower_shade >= 2 * body) and (upper_shade <= body * 0.2) and (c > o):
-        return "Hammer (Bullish Reversal)"
-    elif (upper_shade >= 2 * body) and (lower_shade <= body * 0.2) and (c < o):
-        return "Shooting Star (Bearish)"
-    elif (pc < po) and (c > o) and (c > po) and (o < pc):
-        return "Bullish Engulfing"
-    elif (pc > po) and (c < o) and (c < po) and (o > pc):
-        return "Bearish Engulfing"
-    elif (c > o) and (body >= candle_range * 0.6):
-        return "Strong Bullish Candle"
-    else:
-        return "Neutral / Consolidation"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.bseindia.com/",
+}
 
-# -----------------------------------------------------------------------------
-# MOCK DATA RETRIEVAL & UNIVERSE GENERATION
-# -----------------------------------------------------------------------------
-@st.cache_data(ttl=3600)
-def load_stock_universe(exchange):
-    # Sample universe for demo (In production, load full ticker CSV/API)
-    sample_tickers = [
-        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
-        "BHARTIARTL.NS", "ITC.NS", "SBIN.NS", "LTIM.NS", "LT.NS",
-        "HINDUNILVR.NS", "AXISBANK.NS", "ADANIENT.NS", "SUNPHARMA.NS", "TITAN.NS",
-        "TATASTEEL.NS", "MARUTI.NS", "NTPC.NS", "POWERGRID.NS", "M&M.NS"
-    ]
-    return sample_tickers
-
-# -----------------------------------------------------------------------------
-# 100-POINT SCORING SYSTEM LOGIC (ALL 20 PARAMETERS)
-# -----------------------------------------------------------------------------
-def score_stock(ticker):
+def safe_num(x):
     try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="1y")
-        
-        if hist.empty or len(hist) < 200:
-            return None
-        
-        # Flatten MultiIndex columns if present
-        if isinstance(hist.columns, pd.MultiIndex):
-            hist.columns = hist.columns.get_level_values(0)
-            
-        info = stock.info
-        
-        # ---------------------------------------------------------------------
-        # A. FUNDAMENTAL QUALITY (30 POINTS MAX)
-        # ---------------------------------------------------------------------
-        fund_score = 0
-        
-        # 1. Sales Growth (5 Pts)
-        sales_growth = info.get('revenueGrowth', 0.12) * 100 if info.get('revenueGrowth') else 12.0
-        if sales_growth >= 20: fund_score += 5
-        elif sales_growth >= 10: fund_score += 4
-        elif sales_growth > 0: fund_score += 2.5
-        
-        # 2. Profit Growth / PAT (5 Pts)
-        pat_growth = info.get('earningsGrowth', 0.15) * 100 if info.get('earningsGrowth') else 15.0
-        if pat_growth >= 20: fund_score += 5
-        elif pat_growth >= 10: fund_score += 4
-        elif pat_growth > 0: fund_score += 2.5
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return np.nan
+        return float(x)
+    except Exception:
+        return np.nan
 
-        # 3. EPS Growth (4 Pts)
-        eps_growth = info.get('earningsQuarterlyGrowth', 0.10) * 100 if info.get('earningsQuarterlyGrowth') else 10.0
-        if eps_growth >= 20: fund_score += 4
-        elif eps_growth >= 10: fund_score += 3
-        elif eps_growth > 0: fund_score += 2
+def pct(x):
+    return np.nan if pd.isna(x) else float(x) * 100
 
-        # 4. ROCE (4 Pts)
-        roce = info.get('returnOnAssets', 0.12) * 100 * 1.3 if info.get('returnOnAssets') else 16.0
-        if roce > 15: fund_score += 4
-        elif roce >= 10: fund_score += 2.5
-        elif roce >= 5: fund_score += 1.5
+def score_positive_growth(v, max_points):
+    if pd.isna(v): return 0
+    if v >= 20: return max_points
+    if v >= 10: return max_points * 0.8
+    if v > 0: return max_points * 0.5
+    return 0
 
-        # 5. ROE (3 Pts)
-        roe = info.get('returnOnEquity', 0.14) * 100 if info.get('returnOnEquity') else 14.0
-        if roe >= 15: fund_score += 3
-        elif roe >= 12: fund_score += 2.5
-        elif roe >= 8: fund_score += 1.5
+def score_roce(v):
+    if pd.isna(v): return 0
+    if v >= 20: return 4
+    if v >= 15: return 3.5
+    if v >= 10: return 2.5
+    if v >= 5: return 1
+    return 0
 
-        # 6. Debt to Equity Ratio (3 Pts)
-        de_ratio = info.get('debtToEquity', 35) / 100 if info.get('debtToEquity') else 0.35
-        if de_ratio <= 0.3: fund_score += 3
-        elif de_ratio <= 0.6: fund_score += 2.5
-        elif de_ratio <= 1.0: fund_score += 1.5
+def score_roe(v):
+    if pd.isna(v): return 0
+    if v >= 18: return 3
+    if v >= 15: return 2.7
+    if v >= 12: return 2.2
+    if v >= 8: return 1
+    return 0
 
-        # 7. Operating Cash Flow (3 Pts)
-        ocf = info.get('operatingCashflow', 1000)
-        if ocf and ocf > 0: fund_score += 3
+def score_de(v):
+    if pd.isna(v): return 1.5
+    if v <= 0.3: return 3
+    if v <= 0.6: return 2.5
+    if v <= 1.0: return 1.5
+    if v <= 1.5: return 0.75
+    return 0
 
-        # 8. Promoter Holding & Pledge (2 Pts)
-        promoter_hold = info.get('heldPercentInsiders', 0.55) * 100 if info.get('heldPercentInsiders') else 55.0
-        if promoter_hold >= 50: fund_score += 2
-        elif promoter_hold >= 35: fund_score += 1
+def score_ocf(v):
+    if pd.isna(v): return 0
+    return 3 if v > 0 else 0
 
-        # 9 & 10. Valuation & Earnings Visibility (1 Pt)
-        pe_ratio = info.get('forwardPE', 22) if info.get('forwardPE') else 22
-        if pe_ratio <= 35: fund_score += 1
+def score_promoter(v):
+    if pd.isna(v): return 1
+    if v >= 60: return 2
+    if v >= 40: return 1.5
+    if v >= 25: return 1
+    return 0.5
 
-        # ---------------------------------------------------------------------
-        # B. TECHNICAL ANALYSIS & PRICE ACTION (20 POINTS MAX)
-        # ---------------------------------------------------------------------
-        tech_score = 0
-        close = hist['Close'].iloc[-1]
-        
-        # Moving Averages
-        dma_50 = hist['Close'].rolling(50).mean().iloc[-1]
-        dma_200 = hist['Close'].rolling(200).mean().iloc[-1]
-        dma_200_20d_ago = hist['Close'].rolling(200).mean().iloc[-21]
-        
-        # 11. Moving Averages: Price > 50 DMA > 200 DMA (5 Pts)
-        if close > dma_50 > dma_200: tech_score += 5
-        elif close > dma_50: tech_score += 3
+def score_pe(pe):
+    if pd.isna(pe) or pe <= 0: return 0.5
+    if pe <= 15: return 1
+    if pe <= 25: return 0.8
+    if pe <= 40: return 0.5
+    return 0
 
-        # 12. 200 DMA Upward Sloping (3 Pts)
-        if dma_200 > dma_200_20d_ago: tech_score += 3
+def calc_rsi(close, period=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-        # 13. Price Structure: Higher High / Higher Low (4 Pts)
-        low_20 = hist['Low'].tail(20).min()
-        high_20 = hist['High'].tail(20).max()
-        ret_3m = (close - hist['Close'].iloc[-63]) / hist['Close'].iloc[-63]
-        if close > dma_50 and ret_3m > 0: tech_score += 4
+def max_drawdown(close):
+    peak = close.cummax()
+    dd = close / peak - 1
+    return abs(dd.min()) * 100 if len(dd) else np.nan
 
-        # 14. Support / Resistance Proximity (4 Pts)
-        if (close >= high_20 * 0.95) or (close <= low_20 * 1.03): tech_score += 4
-
-        # 15. Breakout & Volume Expansion (4 Pts)
-        vol_avg_20 = hist['Volume'].tail(20).mean()
-        latest_vol = hist['Volume'].iloc[-1]
-        vol_ratio = latest_vol / vol_avg_20 if vol_avg_20 > 0 else 1.0
-        if vol_ratio >= 1.2: tech_score += 4
-
-        # ---------------------------------------------------------------------
-        # C. MOMENTUM, SECTOR & CATALYSTS (25 POINTS MAX)
-        # ---------------------------------------------------------------------
-        mom_score = 0
-        
-        # 16. RSI Indicator (15 Pts Category)
-        delta = hist['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs)).iloc[-1]
-        
-        if 55 <= rsi <= 70: mom_score += 15
-        elif 50 <= rsi <= 75: mom_score += 10
-        elif rsi > 40: mom_score += 5
-
-        # 17, 18 & 19. Relative Strength, Sector Strength & Catalysts (10 Pts)
-        if ret_3m > 0.05 and vol_ratio >= 1.0: mom_score += 10
-        elif ret_3m > 0: mom_score += 5
-
-        # ---------------------------------------------------------------------
-        # D. GLOBAL MACRO & RISK MANAGEMENT (15 POINTS MAX)
-        # ---------------------------------------------------------------------
-        macro_risk_score = 0
-        
-        # 20. Global Macro Baseline (10 Pts)
-        macro_risk_score += 10
-        
-        # Risk / Reward Structure (5 Pts)
-        stop_loss = max(low_20 * 0.98, close * 0.92)
-        target = close + ((close - stop_loss) * 2)
-        risk = close - stop_loss
-        reward = target - close
-        rr_ratio = reward / risk if risk > 0 else 0
-        
-        if rr_ratio >= 2.0: macro_risk_score += 5
-        elif rr_ratio >= 1.5: macro_risk_score += 3
-
-        # ---------------------------------------------------------------------
-        # TOTAL SCORE & SUMMARY PACKAGING
-        # ---------------------------------------------------------------------
-        total_score = min(100, fund_score + tech_score + mom_score + macro_risk_score)
-        pattern = detect_candlestick_patterns(hist)
-        
-        return {
-            "Ticker": ticker.replace(".NS", "").replace(".BO", ""),
-            "Total Score": round(total_score, 1),
-            "Fundamental (30)": round(fund_score, 1),
-            "Technical (20)": round(tech_score, 1),
-            "Momentum/Sector (25)": round(mom_score, 1),
-            "Macro/Risk (25)": round(macro_risk_score, 1),
-            "Price (₹)": round(close, 2),
-            "RSI (14)": round(rsi, 1),
-            "Volume Ratio": f"{vol_ratio:.2f}x",
-            "Candle Pattern": pattern,
-            "Stop Loss (₹)": round(stop_loss, 2),
-            "Target (₹)": round(target, 2),
-            "R:R Ratio": f"1:{rr_ratio:.1f}",
-            "df": hist
-        }
-        
-    except Exception as e:
-        return None
-
-# -----------------------------------------------------------------------------
-# MAIN APP ENGINE EXECUTOR
-# -----------------------------------------------------------------------------
-if st.button("🚀 RUN PMS SCAN", type="primary"):
-    tickers = load_stock_universe(exchange_choice)[:max_candidates]
-    st.info(f"Scanning {len(tickers)} stocks against the 20-Step 100-Point Model...")
+# -----------------------------
+# Candlestick Pattern Engine
+# -----------------------------
+def detect_candlestick_patterns(df):
+    if df is None or len(df) < 2:
+        return "Insufficient Data", "Neutral"
     
-    results = []
-    progress_bar = st.progress(0)
+    prev, curr = df.iloc[-2], df.iloc[-1]
+    c_open, c_close, c_high, c_low = float(curr['Open']), float(curr['Close']), float(curr['High']), float(curr['Low'])
+    p_open, p_close = float(prev['Open']), float(prev['Close'])
     
-    for idx, t in enumerate(tickers):
-        res = score_stock(t)
-        if res:
-            results.append(res)
-        progress_bar.progress((idx + 1) / len(tickers))
-        
-    if results:
-        df_res = pd.DataFrame(results)
-        df_res = df_res.sort_values(by="Total Score", ascending=False).reset_index(drop=True)
-        
-        # Summary Metrics
-        st.markdown("---")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Scanned Stocks", len(df_res))
-        col2.metric("Top Conviction (80+)", len(df_res[df_res['Total Score'] >= 80]))
-        col3.metric("Moderate (65-79)", len(df_res[(df_res['Total Score'] >= 65) & (df_res['Total Score'] < 80)]))
-        col4.metric("Avg Score", round(df_res['Total Score'].mean(), 1))
+    body = abs(c_close - c_open)
+    candle_range = c_high - c_low
+    is_bullish = c_close > c_open
+    is_bearish = c_close < c_open
+    
+    if body <= (candle_range * 0.1) and candle_range > 0:
+        return "Doji", "Indecision / Reversal Warning"
+    elif p_close < p_open and is_bullish and c_close >= p_open and c_open <= p_close:
+        return "Bullish Engulfing", "Bullish (Up ↑)"
+    elif p_close > p_open and is_bearish and c_close <= p_open and c_open >= p_close:
+        return "Bearish Engulfing", "Bearish (Down ↓)"
+    elif (c_high - max(c_open, c_close)) < (body * 0.5) and (min(c_open, c_close) - c_low) >= (2 * body):
+        return "Hammer / Pinbar", "Bullish (Up ↑)"
+    elif (c_high - max(c_open, c_close)) >= (2 * body) and (min(c_open, c_close) - c_low) < (body * 0.5):
+        return "Shooting Star", "Bearish (Down ↓)"
+    elif is_bullish:
+        return "Bullish Candle", "Bullish (Up ↑)"
+    elif is_bearish:
+        return "Bearish Candle", "Bearish (Down ↓)"
+    
+    return "No Clear Pattern", "Neutral"
 
-        # Main Data Table
-        st.subheader("📋 PMS Stock Leaderboard")
-        
-        display_cols = [
-            "Ticker", "Total Score", "Fundamental (30)", "Technical (20)",
-            "Momentum/Sector (25)", "Macro/Risk (25)", "Price (₹)", 
-            "RSI (14)", "Volume Ratio", "Candle Pattern", "Stop Loss (₹)", "Target (₹)", "R:R Ratio"
-        ]
-        
-        st.dataframe(
-            df_res[display_cols].style.background_gradient(subset=["Total Score"], cmap="RdYlGn"),
-            use_container_width=True
-        )
+def _download_upstox_instruments(url, exchange):
+    r = requests.get(url, headers={
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": "application/gzip, application/octet-stream, */*",
+    }, timeout=45)
+    r.raise_for_status()
+    raw = gzip.decompress(r.content)
+    data = pd.read_json(io.BytesIO(raw))
+    if data.empty:
+        return pd.DataFrame()
 
-        # ---------------------------------------------------------------------
-        # CANDLESTICK CHART ENGINE DEEP DIVE
-        # ---------------------------------------------------------------------
-        st.markdown("---")
-        st.subheader("📈 Interactive Candlestick Deep-Dive")
-        
-        selected_ticker = st.selectbox("Select Stock for Technical & Candlestick Analysis:", df_res['Ticker'].tolist())
-        selected_data = next(item for item in results if item["Ticker"] == selected_ticker)
-        
-        hist_df = selected_data["df"].tail(100)
-        
-        fig = go.Figure(data=[go.Candlestick(
-            x=hist_df.index,
-            open=hist_df['Open'],
-            high=hist_df['High'],
-            low=hist_df['Low'],
-            close=hist_df['Close'],
-            name="Price"
-        )])
-        
-        # Add 50 DMA and 200 DMA Lines
-        hist_df['DMA_50'] = hist_df['Close'].rolling(50).mean()
-        hist_df['DMA_200'] = hist_df['Close'].rolling(200).mean()
-        
-        fig.add_trace(go.Scatter(x=hist_df.index, y=hist_df['DMA_50'], mode='lines', name='50 DMA', line=dict(color='orange', width=1.5)))
-        fig.add_trace(go.Scatter(x=hist_df.index, y=hist_df['DMA_200'], mode='lines', name='200 DMA', line=dict(color='blue', width=1.5)))
+    data["segment"] = data.get("segment", "").astype(str).str.upper()
+    data["instrument_type"] = data.get("instrument_type", "").astype(str).str.upper()
+    data = data[(data["segment"].eq(f"{exchange}_EQ")) & (data["instrument_type"].eq("EQ"))].copy()
 
-        fig.update_layout(
-            title=f"{selected_ticker} Daily Candlestick Chart (Pattern: {selected_data['Candle Pattern']})",
-            yaxis_title="Price (₹)",
-            xaxis_title="Date",
-            template="plotly_white",
-            height=500,
-            xaxis_rangeslider_visible=False
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
+    if data.empty:
+        return pd.DataFrame()
 
+    symbol = data.get("trading_symbol", pd.Series(index=data.index, dtype=str)).astype(str).str.strip().str.upper()
+    name = data.get("name", data.get("short_name", symbol)).astype(str).str.strip()
+    isin = data.get("isin", pd.Series(index=data.index, dtype=str)).astype(str).str.strip().replace("nan", "")
+    token = data.get("exchange_token", pd.Series(index=data.index, dtype=str)).astype(str).str.strip()
+
+    out = pd.DataFrame({
+        "symbol": symbol,
+        "name": name,
+        "exchange": exchange,
+        "isin": isin,
+        "instrument_key": data.get("instrument_key", "").astype(str),
+        "exchange_token": token,
+    })
+    out = out[(out["symbol"].ne("")) & (out["symbol"].ne("NAN"))].copy()
+    if exchange == "NSE":
+        out["ticker"] = out["symbol"] + ".NS"
     else:
-        st.warning("No stock data could be fetched. Please check your internet connection or ticker universe.")
+        out["bse_code"] = out["exchange_token"].str.extract(r"(\d+)")[0]
+        out["ticker"] = out["bse_code"] + ".BO"
+        out = out[out["bse_code"].notna()]
+    return out.drop_duplicates("instrument_key")
+
+def get_nse_universe():
+    try:
+        return _download_upstox_instruments(UPSTOX_NSE_INSTRUMENTS, "NSE")
+    except Exception:
+        return pd.DataFrame(columns=["symbol", "name", "exchange", "ticker", "isin", "instrument_key", "exchange_token"])
+
+def get_bse_universe():
+    try:
+        return _download_upstox_instruments(UPSTOX_BSE_INSTRUMENTS, "BSE")
+    except Exception:
+        return pd.DataFrame(columns=["symbol", "name", "exchange", "ticker", "isin", "instrument_key", "exchange_token", "bse_code"])
+
+@st.cache_data(ttl=6*60*60, show_spinner=False)
+def build_universe():
+    nse = get_nse_universe()
+    bse = get_bse_universe()
+    if nse.empty and bse.empty:
+        return pd.DataFrame()
+    all_df = pd.concat([nse, bse], ignore_index=True, sort=False)
+    all_df["key"] = all_df["isin"].where(all_df["isin"].fillna("").ne(""), all_df["name"].str.upper().str.replace(r"[^A-Z0-9]", "", regex=True))
+    all_df["universe_source"] = "Upstox BOD instrument master"
+    all_df["is_nse"] = all_df["exchange"].eq("NSE")
+    all_df = all_df.sort_values(["key", "is_nse"], ascending=[True, False])
+    return all_df.reset_index(drop=True)
+
+@st.cache_data(ttl=30*60, show_spinner=False)
+def download_history(tickers, period="1y"):
+    tickers = list(dict.fromkeys(tickers))
+    if not tickers:
+        return pd.DataFrame()
+    frames = []
+    for i in range(0, len(tickers), 100):
+        batch = tickers[i:i+100]
+        try:
+            d = yf.download(batch, period=period, interval="1d", auto_adjust=False,
+                             progress=False, group_by="ticker", threads=True)
+            if d is not None and not d.empty:
+                frames.append(d)
+        except Exception:
+            pass
+    if not frames:
+        return pd.DataFrame()
+    return frames[0] if len(frames) == 1 else pd.concat(frames, axis=1)
+
+def extract_ticker_history(data, ticker):
+    if data.empty:
+        return pd.DataFrame()
+    try:
+        if isinstance(data.columns, pd.MultiIndex):
+            if ticker in data.columns.get_level_values(0):
+                x = data[ticker].copy()
+            elif ticker in data.columns.get_level_values(1):
+                x = data.xs(ticker, axis=1, level=1).copy()
+            else:
+                return pd.DataFrame()
+        else:
+            x = data.copy()
+            
+        if isinstance(x.columns, pd.MultiIndex):
+            x.columns = x.columns.get_level_values(0)
+            
+        x.columns = [str(c).title() for c in x.columns]
+        needed = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in x.columns]
+        return x[needed].dropna(subset=["Close"])
+    except Exception:
+        return pd.DataFrame()
+
+def technical_metrics(h):
+    if h.empty or len(h) < 100:
+        return {}
+    close = h["Close"].astype(float)
+    vol = h["Volume"].astype(float)
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    rsi = calc_rsi(close)
+    recent = close.iloc[-1]
+    rsi_now = float(rsi.iloc[-1]) if not rsi.empty else np.nan
+    avgvol20 = vol.rolling(20).mean().iloc[-1]
+    vol_ratio = float(vol.iloc[-1] / avgvol20) if avgvol20 else np.nan
+    high20 = close.iloc[-21:-1].max() if len(close) >= 21 else close.max()
+    low20 = close.iloc[-21:-1].min() if len(close) >= 21 else close.min()
+    ret3m = (recent / close.iloc[-64] - 1) * 100 if len(close) >= 64 else np.nan
+    ret6m = (recent / close.iloc[-127] - 1) * 100 if len(close) >= 127 else np.nan
+    
+    d200_val = sma200.iloc[-1] if not pd.isna(sma200.iloc[-1]) else sma50.iloc[-1]
+    d200_prev = sma200.iloc[-21] if len(sma200) >= 21 and not pd.isna(sma200.iloc[-21]) else d200_val
+    
+    return {
+        "price": recent,
+        "dma50": sma50.iloc[-1],
+        "dma200": d200_val,
+        "dma200_prev20": d200_prev,
+        "rsi": rsi_now,
+        "volume_ratio": vol_ratio,
+        "high20": high20,
+        "low20": low20,
+        "ret3m": ret3m,
+        "ret6m": ret6m,
+        "drawdown": max_drawdown(close.iloc[-252:]) if len(close) >= 252 else np.nan,
+        "near_high_pct": (high20 - recent) / high20 * 100 if high20 else np.nan,
+    }
+
+def score_technical(m):
+    if not m: return 0
+    p, d50, d200 = m["price"], m["dma50"], m["dma200"]
+    score = 0
+    score += 2 if not pd.isna(d200) and p > d200 else 0
+    score += 2 if not pd.isna(d50) and p > d50 else 0
+    score += 2 if not pd.isna(d50) and not pd.isna(d200) and d50 > d200 else 0
+    score += 2 if not pd.isna(m["dma200_prev20"]) and not pd.isna(d200) and m["dma200_prev20"] < d200 else 0
+    score += 2 if not pd.isna(m["low20"]) and p > m["low20"] * 1.03 else 0
+    score += 2 if not pd.isna(m["near_high_pct"]) and 0 <= m["near_high_pct"] <= 5 else 0
+    score += 2 if not pd.isna(m["volume_ratio"]) and m["volume_ratio"] >= 1.2 else (1 if not pd.isna(m["volume_ratio"]) and m["volume_ratio"] >= 0.9 else 0)
+    score += 2 if not pd.isna(m["rsi"]) and 55 <= m["rsi"] <= 70 else (1 if not pd.isna(m["rsi"]) and 50 <= m["rsi"] <= 75 else 0)
+    score += 2 if not pd.isna(d50) and p > d50 and not pd.isna(m["ret3m"]) and m["ret3m"] > 0 else 0
+    score += 2 if not pd.isna(m["near_high_pct"]) and m["near_high_pct"] <= 1.5 and not pd.isna(m["volume_ratio"]) and m["volume_ratio"] >= 1.2 else 0
+    return round(min(score, 20), 2)
+
+def fetch_info(ticker):
+    try:
+        t = yf.Ticker(ticker)
+        info = t.fast_info
+        out = {
+            "price": safe_num(info.get("last_price")),
+            "market_cap": safe_num(info.get("market_cap")),
+        }
+        try:
+            full = t.get_info()
+        except Exception:
+            full = {}
+        keys = ["returnOnEquity", "returnOnAssets", "debtToEquity", "trailingPE",
+                "priceToBook", "profitMargins", "revenueGrowth", "earningsGrowth",
+                "enterpriseToEbitda", "totalRevenue", "operatingCashflow",
+                "sharesPercentInsiders", "heldPercentInsiders"]
+        for k in keys:
+            out[k] = safe_num(full.get(k))
+        return out
+    except Exception:
+        return {}
+
+def fundamental_score(info):
+    s = 0
+    sales_g = pct(info.get("revenueGrowth"))
+    profit_g = pct(info.get("earningsGrowth"))
+    roe = pct(info.get("returnOnEquity"))
+    de = info.get("debtToEquity")
+    if not pd.isna(de): de = de / 100 if de > 10 else de
+    s += score_positive_growth(sales_g, 5)
+    s += score_positive_growth(profit_g, 5)
+    s += score_positive_growth(profit_g, 4)
+    s += score_roce(np.nan)
+    s += score_roe(roe)
+    s += score_de(de)
+    ocf = info.get("operatingCashflow")
+    s += score_ocf(ocf)
+    promoter = pct(info.get("heldPercentInsiders"))
+    s += score_promoter(promoter)
+    s += score_pe(info.get("trailingPE"))
+    return round(min(s, 30), 2)
+
+def label_score(score):
+    if score >= 80: return "Strong Buy Candidate"
+    if score >= 70: return "Watchlist / Buy on confirmation"
+    if score >= 60: return "Wait"
+    if score >= 50: return "Weak / Avoid"
+    return "Reject"
+
+def risk_score(m):
+    if not m: return 0, np.nan, np.nan, np.nan
+    price = m["price"]
+    sl = max(price * 0.92, m["low20"] * 0.98) if not pd.isna(m["low20"]) else price * 0.92
+    risk = price - sl
+    target = price + 2 * risk if risk > 0 else np.nan
+    score = 5 if risk > 0 and (target - price) / risk >= 2 else 2
+    return score, sl, target, (target - price) / risk if risk > 0 else np.nan
+
+def build_rows(universe, history, max_fundamentals, min_mcap_cr, min_sales_growth, min_pat_growth, min_roe, min_turnover_cr):
+    rows = []
+    candidates = []
+    for _, u in universe.iterrows():
+        h = extract_ticker_history(history, u["ticker"])
+        m = technical_metrics(h)
+        if not m:
+            continue
+        if m["price"] <= 0:
+            continue
+        turnover = float((h["Close"] * h["Volume"]).tail(20).mean()) if not h.empty else 0
+        if turnover < min_turnover_cr * 10_000_000:
+            continue
+        tech = score_technical(m)
+        candidates.append((u, m, turnover, tech, h))
+    candidates.sort(key=lambda x: (x[3], x[2]), reverse=True)
+    candidates = candidates[:max_fundamentals]
+
+    nifty_hist = extract_ticker_history(history, "^NSEI")
+    nifty_ret3 = np.nan
+    if not nifty_hist.empty and len(nifty_hist) >= 64:
+        nifty_ret3 = (nifty_hist["Close"].iloc[-1] / nifty_hist["Close"].iloc[-64] - 1) * 100
+
+    for u, m, turnover, tech, h in candidates:
+        info = fetch_info(u["ticker"])
+        fscore = fundamental_score(info)
+        sales_g = pct(info.get("revenueGrowth"))
+        pat_g = pct(info.get("earningsGrowth"))
+        roe = pct(info.get("returnOnEquity"))
+        mcap_cr = info.get("market_cap") / 1e7 if not pd.isna(info.get("market_cap")) else np.nan
+
+        if not pd.isna(mcap_cr) and mcap_cr < min_mcap_cr:
+            continue
+        if not pd.isna(sales_g) and sales_g < min_sales_growth:
+            continue
+        if not pd.isna(pat_g) and pat_g < min_pat_growth:
+            continue
+        if not pd.isna(roe) and roe < min_roe:
+            continue
+
+        momentum = 0
+        if not pd.isna(m["ret3m"]) and m["ret3m"] > 0: momentum += 5
+        if not pd.isna(m["ret3m"]) and m["ret3m"] >= 10: momentum += 2
+        if not pd.isna(nifty_ret3) and not pd.isna(m["ret3m"]) and m["ret3m"] > nifty_ret3: momentum += 5
+        if not pd.isna(m["rsi"]) and 55 <= m["rsi"] <= 70: momentum += 3
+        momentum = min(momentum, 15)
+
+        sector = 5
+        sector += 3 if not pd.isna(m["dma200"]) and m["price"] > m["dma200"] else 0
+        sector += 2 if not pd.isna(m["volume_ratio"]) and m["volume_ratio"] >= 1 else 0
+        sector = min(sector, 10)
+
+        earnings = 0
+        if not pd.isna(pat_g) and pat_g > 0: earnings += 4
+        if not pd.isna(sales_g) and sales_g > 0: earnings += 3
+        if not pd.isna(info.get("earningsGrowth")) and info.get("earningsGrowth") > 0: earnings += 3
+        earnings = min(earnings, 10)
+
+        macro = 5
+        macro += 5 if not pd.isna(m["ret3m"]) and m["ret3m"] > 0 else 0
+        macro = min(macro, 10)
+
+        rscore, sl, target, rr = risk_score(m)
+        total = round(fscore + tech + momentum + sector + earnings + macro + rscore, 2)
+        
+        # Detect Candlestick Pattern
+        c_pattern, c_signal = detect_candlestick_patterns(h)
+
+        rows.append({
+            "Rank": 0,
+            "Stock": u["symbol"],
+            "Ticker": u["ticker"],
+            "Company": u["name"],
+            "Exchange": u["exchange"],
+            "Price": round(m["price"], 2),
+            "Candle Pattern": c_pattern,
+            "Signal": c_signal,
+            "Market Cap (₹ Cr)": round(mcap_cr, 1) if not pd.isna(mcap_cr) else np.nan,
+            "PMS Score": total,
+            "Decision": label_score(total),
+            "Fundamental /30": fscore,
+            "Technical /20": tech,
+            "Momentum /15": momentum,
+            "Sector /10": sector,
+            "Earnings /10": earnings,
+            "Global /10": macro,
+            "Risk /5": rscore,
+            "RSI": round(m["rsi"], 1) if not pd.isna(m["rsi"]) else np.nan,
+            "3M %": round(m["ret3m"], 2) if not pd.isna(m["ret3m"]) else np.nan,
+            "Volume x": round(m["volume_ratio"], 2) if not pd.isna(m["volume_ratio"]) else np.nan,
+            "50 DMA": round(m["dma50"], 2) if not pd.isna(m["dma50"]) else np.nan,
+            "200 DMA": round(m["dma200"], 2) if not pd.isna(m["dma200"]) else np.nan,
+            "Stop Loss": round(sl, 2) if not pd.isna(sl) else np.nan,
+            "Target (1:2)": round(target, 2) if not pd.isna(target) else np.nan,
+            "R:R": round(rr, 2) if not pd.isna(rr) else np.nan,
+            "Avg Turnover ₹/day": round(turnover, 0),
+        })
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows).sort_values(["PMS Score", "Technical /20"], ascending=False).reset_index(drop=True)
+    out["Rank"] = np.arange(1, len(out) + 1)
+    return out
+
+# -----------------------------
+# UI Layout
+# -----------------------------
+st.title("📈 PMS Stock Filter & Candlestick Analyzer — NSE + BSE")
+st.caption("Rule-based screening from PMS.xlsx with Candlestick Pattern Detection.")
+
+with st.sidebar:
+    st.header("1. Universe")
+    universe = build_universe()
+    if universe.empty:
+        st.error("Could not download the exchange universe. Check your internet connection.")
+        st.stop()
+    st.success(f"Universe loaded: {len(universe):,} NSE/BSE equity records")
+    exchange_choice = st.selectbox("Exchange universe", ["NSE + BSE", "NSE only", "BSE only"])
+    if exchange_choice == "NSE only":
+        universe = universe[universe.exchange.eq("NSE")].copy()
+    elif exchange_choice == "BSE only":
+        universe = universe[universe.exchange.eq("BSE")].copy()
+
+    st.header("2. PMS Filters")
+    min_mcap_cr = st.number_input("Minimum market cap (₹ crore)", min_value=0.0, value=1000.0, step=500.0)
+    min_sales_growth = st.number_input("Minimum Sales growth %", value=0.0, step=1.0)
+    min_pat_growth = st.number_input("Minimum PAT growth %", value=0.0, step=1.0)
+    min_roe = st.number_input("Minimum ROE %", value=5.0, step=1.0)
+    min_turnover = st.number_input("Minimum average daily turnover (₹ crore)", value=0.1, step=0.1)
+    max_fundamentals = st.slider("Maximum stocks for detailed fundamental scoring", 50, 1000, 150, 50)
+
+    st.header("3. Scan")
+    run = st.button("🚀 RUN PMS SCAN", type="primary", use_container_width=True)
+    refresh = st.button("🔄 Refresh exchange universe", use_container_width=True)
+
+if refresh:
+    st.cache_data.clear()
+    st.rerun()
+
+if "results" not in st.session_state:
+    st.session_state.results = pd.DataFrame()
+if "history" not in st.session_state:
+    st.session_state.history = pd.DataFrame()
+
+if run:
+    with st.spinner("Downloading price history for NSE/BSE universe and calculating technical signals…"):
+        tickers = [t for t in universe["ticker"].dropna().unique().tolist()]
+        if "^NSEI" not in tickers:
+            tickers.append("^NSEI")
+        history = download_history(tickers, period="1y")
+        st.session_state.history = history
+        
+    with st.spinner("Scoring candidates against PMS parameters and Candlesticks…"):
+        result = build_rows(universe, history, max_fundamentals, min_mcap_cr, min_sales_growth, min_pat_growth, min_roe, min_turnover)
+        st.session_state.results = result
+
+results = st.session_state.results
+
+st.subheader("PMS Ranking & Candlestick Analysis")
+if results.empty:
+    st.info("Click **RUN PMS SCAN** in the sidebar to scan the exchange universe.")
+else:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Stocks passing", len(results))
+    c2.metric("Strong Buy candidates", int((results["PMS Score"] >= 80).sum()))
+    c3.metric("Watchlist", int(((results["PMS Score"] >= 70) & (results["PMS Score"] < 80)).sum()))
+    c4.metric("Best PMS score", f"{results['PMS Score'].max():.0f}/100")
+
+    show_cols = ["Rank", "Stock", "Company", "Exchange", "Price", "Candle Pattern", "Signal", "PMS Score", "Decision",
+                 "Fundamental /30", "Technical /20", "Momentum /15", "Sector /10", "Earnings /10",
+                 "Global /10", "Risk /5", "RSI", "3M %", "Volume x", "Stop Loss", "Target (1:2)"]
+    st.dataframe(results[show_cols], use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "⬇️ Download PMS results CSV",
+        results.to_csv(index=False).encode("utf-8"),
+        file_name=f"PMS_scan_{datetime.now():%Y%m%d_%H%M}.csv",
+        mime="text/csv",
+    )
+
+    st.divider()
+    st.subheader("📊 Interactive Candlestick Chart & Deep Dive")
+    selected_stock = st.selectbox("Select stock to view chart:", results["Stock"].tolist())
+    
+    if selected_stock:
+        selected_row = results[results.Stock.eq(selected_stock)].iloc[0]
+        st_ticker = selected_row["Ticker"]
+        
+        cols = st.columns(7)
+        for c, name in zip(cols, ["PMS Score", "Fundamental /30", "Technical /20", "Momentum /15", "Sector /10", "Earnings /10", "Risk /5"]):
+            c.metric(name, f"{selected_row[name]:.1f}")
+
+        st.markdown(f"### **{selected_row['Stock']} — {selected_row['Company']}** ({selected_row['Exchange']})")
+        st.write(f"**Candle Pattern:** {selected_row['Candle Pattern']} | **Signal:** {selected_row['Signal']} | **Decision:** {selected_row['Decision']}")
+        st.write(f"Price ₹{selected_row['Price']:.2f} | Stop ₹{selected_row['Stop Loss']:.2f} | Target ₹{selected_row['Target (1:2)']:.2f} | R:R {selected_row['R:R']:.2f}")
+
+        # Render Candlestick Chart
+        chart_h = extract_ticker_history(st.session_state.history, st_ticker)
+        if not chart_h.empty:
+            tf = st.radio("Timeframe View:", ["Daily", "Weekly", "Monthly"], horizontal=True)
+            if tf == "Weekly":
+                chart_df = chart_h.resample('W').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
+            elif tf == "Monthly":
+                chart_df = chart_h.resample('ME').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
+            else:
+                chart_df = chart_h
+
+            fig = go.Figure(data=[go.Candlestick(
+                x=chart_df.index,
+                open=chart_df['Open'], high=chart_df['High'],
+                low=chart_df['Low'], close=chart_df['Close'],
+                name=tf
+            )])
+            fig.update_layout(
+                title=f"{selected_row['Stock']} - {tf} Candlestick Chart",
+                yaxis_title="Price (₹)",
+                xaxis_title="Date",
+                template="plotly_dark",
+                height=500
+            )
+            st.plotly_chart(fig, use_container_width=True)
