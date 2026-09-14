@@ -37,8 +37,12 @@ if uploaded_file is not None:
 else:
     pms_df = get_default_data()
 
+# Parse Tickers
 symbol_col = next((col for col in pms_df.columns if col.lower() in ['symbol', 'ticker', 'stock', 'code']), None)
-tickers_list = pms_df[symbol_col].dropna().astype(str).str.strip().tolist() if symbol_col else [d['Symbol'] for d in DEFAULT_PORTFOLIO]
+if symbol_col:
+    tickers_list = pms_df[symbol_col].dropna().astype(str).str.strip().tolist()
+else:
+    tickers_list = [d['Symbol'] for d in DEFAULT_PORTFOLIO]
 
 with st.expander("📁 View / Download Current Watchlist", expanded=False):
     st.dataframe(pms_df, use_container_width=True)
@@ -85,24 +89,21 @@ def detect_candlestick_patterns(df):
     
     return "No Clear Pattern", "Neutral"
 
-# Robust Data Fetcher
-@st.cache_data(ttl=1800, show_spinner=False)
+# Fixed Data Fetcher (Handles YFinance Updates)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_resampled_data(ticker):
     try:
-        data = yf.Ticker(ticker).history(period="1y", interval="1d")
-        if data.empty:
+        # Download data explicitly without MultiIndex
+        data = yf.download(ticker, period="1y", interval="1d", progress=False, multi_level_index=False)
+        if data.empty or len(data) == 0:
             return None, None, None
             
-        data = data.reset_index()
-        data.rename(columns={'Date': 'Date', 'Open': 'Open', 'High': 'High', 'Low': 'Low', 'Close': 'Close', 'Volume': 'Volume'}, inplace=True)
-        data.set_index('Date', inplace=True)
-        
         df_d = data[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
         df_w = df_d.resample('W').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
         df_m = df_d.resample('ME').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
         
         return df_d, df_w, df_m
-    except Exception as e:
+    except Exception:
         return None, None, None
 
 # App UI Controls
@@ -117,11 +118,11 @@ st.divider()
 if ticker_to_run:
     st.header(f"📈 Pattern Analysis: {ticker_to_run.upper()}")
     
-    with st.spinner("Fetching market data..."):
+    with st.spinner("Fetching market data from Yahoo Finance..."):
         df_d, df_w, df_m = fetch_resampled_data(ticker_to_run)
     
     if df_d is None or df_d.empty:
-        st.error(f"Could not fetch data for '{ticker_to_run}'. Please verify the stock ticker symbol.")
+        st.error(f"⚠️ Could not fetch data for '{ticker_to_run}'. Make sure it's a valid symbol on Yahoo Finance (e.g., `RELIANCE.NS` or `AAPL`).")
     else:
         pat_d, sig_d = detect_candlestick_patterns(df_d)
         pat_w, sig_w = detect_candlestick_patterns(df_w)
